@@ -18,6 +18,7 @@ import logging
 import os.path
 import socket
 import sys
+import csv  # Added for CSV functionality
 from collections import namedtuple
 from datetime import datetime
 
@@ -51,10 +52,12 @@ def resolve_hostname(ip: str) -> str:
     return socket.getfqdn(ip)
 
 
-def fallback(d, keys):
+def fallback(d, keys, default=None):
     for k in keys:
         if k in d:
             return d[k]
+    if default is not None:
+        return default
     raise KeyError(", ".join(keys))
 
 
@@ -77,9 +80,14 @@ def human_duration(seconds):
         return "%d sec" % seconds
     if seconds / 60 > 60:
         # hours
-        return "%d:%02d.%02d hours" % (seconds / 60 ** 2, seconds % 60 ** 2 / 60, seconds % 60)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return "%d:%02d:%02d hours" % (hours, minutes, secs)
     # minutes
-    return "%02d:%02d min" % (seconds / 60, seconds % 60)
+    minutes = seconds // 60
+    secs = seconds % 60
+    return "%02d:%02d min" % (minutes, secs)
 
 
 class Connection:
@@ -87,7 +95,7 @@ class Connection:
     The direction of the data flow can be seen by looking at the size.
 
     'src' describes the peer which sends more data towards the other. This
-    does NOT have to mean that 'src' was the initiator of the connection.
+    DOES NOT have to mean that 'src' was the initiator of the connection.
     """
 
     def __init__(self, flow1, flow2):
@@ -96,8 +104,8 @@ class Connection:
 
         # Assume the size that sent the most data is the source
         # TODO: this might not always be right, maybe use earlier timestamp?
-        size1 = fallback(flow1, ['IN_BYTES', 'IN_OCTETS'])
-        size2 = fallback(flow2, ['IN_BYTES', 'IN_OCTETS'])
+        size1 = fallback(flow1, ['IN_BYTES', 'IN_OCTETS'], default=0)
+        size2 = fallback(flow2, ['IN_BYTES', 'IN_OCTETS'], default=0)
         if size1 >= size2:
             src = flow1
             dest = flow2
@@ -120,16 +128,17 @@ class Connection:
         ips = self.get_ips(src)
         self.src = ips.src
         self.dest = ips.dest
-        self.src_port = fallback(src, ['L4_SRC_PORT', 'SRC_PORT'])
-        self.dest_port = fallback(dest, ['L4_DST_PORT', 'DST_PORT'])
-        self.size = fallback(src, ['IN_BYTES', 'IN_OCTETS'])
+        # Use fallback with default ports to prevent KeyError
+        self.src_port = fallback(src, ['L4_SRC_PORT', 'SRC_PORT'], default=0)
+        self.dest_port = fallback(dest, ['L4_DST_PORT', 'DST_PORT'], default=0)
+        self.size = fallback(src, ['IN_BYTES', 'IN_OCTETS'], default=0)
 
         # Duration is given in milliseconds
-        self.duration = src['LAST_SWITCHED'] - src['FIRST_SWITCHED']
+        self.duration = src.get('LAST_SWITCHED', 0) - src.get('FIRST_SWITCHED', 0)
         if self.duration < 0:
             # 32 bit int has its limits. Handling overflow here
             # TODO: Should be handled in the collection phase
-            self.duration = (2 ** 32 - src['FIRST_SWITCHED']) + src['LAST_SWITCHED']
+            self.duration = (2 ** 32 - src.get('FIRST_SWITCHED', 0)) + src.get('LAST_SWITCHED', 0)
 
     def __repr__(self):
         return "<Connection from {} to {}, size {}>".format(
@@ -141,14 +150,14 @@ class Connection:
         if flow.get('IP_PROTOCOL_VERSION') == 4 or \
                 'IPV4_SRC_ADDR' in flow or 'IPV4_DST_ADDR' in flow:
             return Pair(
-                ipaddress.ip_address(flow['IPV4_SRC_ADDR']),
-                ipaddress.ip_address(flow['IPV4_DST_ADDR'])
+                ipaddress.ip_address(flow.get('IPV4_SRC_ADDR', '0.0.0.0')),
+                ipaddress.ip_address(flow.get('IPV4_DST_ADDR', '0.0.0.0'))
             )
 
         # IPv6
         return Pair(
-            ipaddress.ip_address(flow['IPV6_SRC_ADDR']),
-            ipaddress.ip_address(flow['IPV6_DST_ADDR'])
+            ipaddress.ip_address(flow.get('IPV6_SRC_ADDR', '::')),
+            ipaddress.ip_address(flow.get('IPV6_DST_ADDR', '::'))
         )
 
     @property
@@ -163,23 +172,24 @@ class Connection:
     @property
     def hostnames(self):
         # Resolve the IPs of this flows to their hostname
-        src_hostname = resolve_hostname(self.src.compressed)
-        dest_hostname = resolve_hostname(self.dest.compressed)
+        src_hostname = resolve_hostname(str(self.src))
+        dest_hostname = resolve_hostname(str(self.dest))
         return Pair(src_hostname, dest_hostname)
 
     @property
     def service(self):
         # Resolve ports to their services, if known
-        default = "({} {})".format(self.src_port, self.dest_port)
-        with contextlib.suppress(OSError):
-            return socket.getservbyport(self.src_port)
-        with contextlib.suppress(OSError):
-            return socket.getservbyport(self.dest_port)
-        return default
+        if isinstance(self.src_port, int) and self.src_port > 0:
+            with contextlib.suppress(OSError, ValueError):
+                return socket.getservbyport(self.src_port)
+        if isinstance(self.dest_port, int) and self.dest_port > 0:
+            with contextlib.suppress(OSError, ValueError):
+                return socket.getservbyport(self.dest_port)
+        return "N/A"
 
     @property
     def total_packets(self):
-        return self.src_flow["IN_PKTS"] + self.dest_flow["IN_PKTS"]
+        return self.src_flow.get("IN_PKTS", 0) + self.dest_flow.get("IN_PKTS", 0)
 
 
 if __name__ == "netflow.analyzer":
@@ -198,6 +208,8 @@ if __name__ == "__main__":
                         help="Filter output by matching on the given host (matches source or destination)")
     parser.add_argument("-n", "--no-dns", dest="no_dns", action="store_true",
                         help="Disable DNS resolving of IP addresses")
+    parser.add_argument("-c", "--csv", dest="csv_output", type=str, default=None,
+                        help="Path to output CSV file with headers: Timestamp, Service, Size, Duration, Packets, Source IP, Source Host, Destination IP, Destination Host")
     args = parser.parse_args()
 
     # Sanity check for IP address
@@ -222,9 +234,14 @@ if __name__ == "__main__":
     with gzip.open(file, mode) as gzipped:
         # "for line in" lazy-loads all lines in the file
         for line in gzipped:
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse JSON line: {}. Error: {}".format(line, e))
+                continue
+
             if len(entry.keys()) != 1:
-                logger.warning("The line does not have exactly one timestamp key: \"{}\"".format(line.keys()))
+                logger.warning("The line does not have exactly one timestamp key: \"{}\"".format(list(entry.keys())))
 
             try:
                 ts = list(entry)[0]  # timestamp from key
@@ -253,13 +270,31 @@ if __name__ == "__main__":
 
     first_line = True  # print header line before first line
 
-    for key in sorted(data):
-        timestamp = datetime.fromtimestamp(float(key)).strftime("%Y-%m-%d %H:%M.%S")
-        client = data[key]["client"]
-        flows = data[key]["flows"]
+    # Setup CSV writing if requested
+    csv_file = None
+    csv_writer = None
+    if args.csv_output:
+        try:
+            csv_file = open(args.csv_output, mode='w', newline='')
+            csv_writer = csv.writer(csv_file)
+            # Write CSV header
+            csv_writer.writerow(["Timestamp", "Service", "Size", "Duration", "Packets",
+                                 "Source IP", "Source Host", "Destination IP", "Destination Host"])
+        except IOError as e:
+            logger.error("Failed to open CSV file {} for writing: {}".format(args.csv_output, e))
+            sys.exit(1)
 
-        for flow in sorted(flows, key=lambda x: x["FIRST_SWITCHED"]):
-            first_switched = flow["FIRST_SWITCHED"]
+    for key in sorted(data):
+        try:
+            timestamp = datetime.fromtimestamp(float(key)).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError) as e:
+            logger.error("Invalid timestamp '{}': {}".format(key, e))
+            continue
+        client = data[key].get("client", {})
+        flows = data[key].get("flows", [])
+
+        for flow in sorted(flows, key=lambda x: x.get("FIRST_SWITCHED", 0)):
+            first_switched = flow.get("FIRST_SWITCHED", 0)
 
             if first_switched - 1 in pending:
                 # TODO: handle fitting, yet mismatching (here: 1 second) pairs
@@ -267,11 +302,11 @@ if __name__ == "__main__":
 
             # Find the peer for this connection
             if "IPV4_SRC_ADDR" in flow or flow.get("IP_PROTOCOL_VERSION") == 4:
-                local_peer = flow["IPV4_SRC_ADDR"]
-                remote_peer = flow["IPV4_DST_ADDR"]
+                local_peer = flow.get("IPV4_SRC_ADDR", "0.0.0.0")
+                remote_peer = flow.get("IPV4_DST_ADDR", "0.0.0.0")
             else:
-                local_peer = flow["IPV6_SRC_ADDR"]
-                remote_peer = flow["IPV6_DST_ADDR"]
+                local_peer = flow.get("IPV6_SRC_ADDR", "::")
+                remote_peer = flow.get("IPV6_DST_ADDR", "::")
 
             # Match on host filter passed in as argument
             if args.match_host and not any([local_peer == args.match_host, remote_peer == args.match_host]):
@@ -292,7 +327,12 @@ if __name__ == "__main__":
                 pending[first_switched][local_peer] = flow
                 continue
 
-            con = Connection(flow, peer_flow)
+            try:
+                con = Connection(flow, peer_flow)
+            except KeyError as e:
+                logger.error("Missing expected key when creating Connection: {}".format(e))
+                continue
+
             if con.total_packets < skipped_threshold:
                 skipped += 1
                 continue
@@ -303,15 +343,37 @@ if __name__ == "__main__":
                 print("-" * 100)
                 first_line = False
 
-            print("{timestamp} | {service:<14} | {size:8} | {duration:9} | {packets:7} | "
-                  "Between {src_host} ({src}) and {dest_host} ({dest})"
-                  .format(timestamp=timestamp, service=con.service.upper(), src_host=con.hostnames.src, src=con.src,
-                          dest_host=con.hostnames.dest, dest=con.dest, size=con.human_size, duration=con.human_duration,
-                          packets=con.total_packets))
+            output_line = "{timestamp} | {service:<14} | {size:8} | {duration:9} | {packets:7} | " \
+                          "Between {src_host} ({src}) and {dest_host} ({dest})" \
+                .format(timestamp=timestamp, service=con.service.upper(),
+                        src_host=con.hostnames.src, src=con.src,
+                        dest_host=con.hostnames.dest, dest=con.dest,
+                        size=con.human_size, duration=con.human_duration,
+                        packets=con.total_packets)
+
+            print(output_line)
+
+            # Write to CSV if enabled
+            if csv_writer:
+                csv_writer.writerow([
+                    timestamp,
+                    con.service.upper(),
+                    con.human_size,
+                    con.human_duration,
+                    con.total_packets,
+                    str(con.src),
+                    con.hostnames.src,
+                    str(con.dest),
+                    con.hostnames.dest
+                ])
 
     if skipped > 0:
         print("{skipped} connections skipped, because they had less than {skipped_threshold} packets "
               "(this value can be set with the -p flag).".format(skipped=skipped, skipped_threshold=skipped_threshold))
+
+    if csv_file:
+        csv_file.close()
+        print("CSV output written to {}".format(args.csv_output))
 
     if not args.verbose:
         # Exit here if no debugging session was wanted
@@ -323,19 +385,19 @@ if __name__ == "__main__":
         for first_switched, flows in sorted(pending.items(), key=lambda x: x[0]):
             for peer, flow in flows.items():
                 # Ignore all pings, SYN scans and other noise to find only those peers left over which need a fix
-                if flow["IN_PKTS"] < skipped_threshold:
+                if flow.get("IN_PKTS", 0) < skipped_threshold:
                     continue
                 all_noise = False
 
-                src = flow.get("IPV4_SRC_ADDR") or flow.get("IPV6_SRC_ADDR")
+                src = flow.get("IPV4_SRC_ADDR") or flow.get("IPV6_SRC_ADDR") or "0.0.0.0"
                 src_host = resolve_hostname(src)
                 src_text = "{}".format(src) if src == src_host else "{} ({})".format(src_host, src)
-                dst = flow.get("IPV4_DST_ADDR") or flow.get("IPV6_DST_ADDR")
+                dst = flow.get("IPV4_DST_ADDR") or flow.get("IPV6_DST_ADDR") or "0.0.0.0"
                 dst_host = resolve_hostname(dst)
                 dst_text = "{}".format(dst) if dst == dst_host else "{} ({})".format(dst_host, dst)
-                proto = flow["PROTOCOL"]
-                size = flow["IN_BYTES"]
-                packets = flow["IN_PKTS"]
+                proto = flow.get("PROTOCOL", "UNKNOWN")
+                size = flow.get("IN_BYTES", 0)
+                packets = flow.get("IN_PKTS", 0)
                 src_port = flow.get("L4_SRC_PORT", 0)
                 dst_port = flow.get("L4_DST_PORT", 0)
 

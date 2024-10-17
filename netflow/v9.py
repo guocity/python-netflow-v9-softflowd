@@ -226,6 +226,10 @@ class V9DataFlowSet:
             struct_len += flen
 
         while offset <= (self.length - padding_size):
+            # Ensure the data slice has the correct length before unpacking
+            if len(data[offset:offset + struct_len]) != struct_len:
+                raise struct.error(f"unpack requires a buffer of {struct_len} bytes")
+
             # Here we actually unpack the values, the struct format string is used in every data record
             # iteration, until the final offset reaches the end of the whole data stream
             unpacked_values = struct.unpack(struct_format, data[offset:offset + struct_len])
